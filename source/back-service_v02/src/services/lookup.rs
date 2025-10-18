@@ -1,5 +1,6 @@
+// services/lookup.rs
 use crate::core::errors::AppError;
-use sqlx::{Pool, Postgres, Row};
+use sqlx::{Pool, Postgres};
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone)]
@@ -22,18 +23,51 @@ impl PrefixLookup {
     async fn load_prefixes_from_db(
         pool: &Pool<Postgres>,
     ) -> Result<HashMap<String, (Option<i32>, Option<i32>)>, AppError> {
-        let records = sqlx::query(
-            "SELECT prefix, country_id, operator_id FROM cfg_prefixes WHERE is_valid IS TRUE",
+        // Option 1: Use query macro (requires DATABASE_URL set)
+        let prefixes = sqlx::query!(
+            r#"
+            SELECT prefix, country_id, operator_id 
+            FROM cfg_prefixes 
+            WHERE is_valid IS TRUE
+            "#
         )
         .fetch_all(pool)
         .await?;
 
-        let mut prefix_map = HashMap::with_capacity(records.len());
+        let mut prefix_map = HashMap::with_capacity(prefixes.len());
+        
+        for record in prefixes {
+            prefix_map.insert(
+                record.prefix,
+                (record.country_id, record.operator_id),
+            );
+        }
 
-        for record in records {
-            let prefix: String = record.get("prefix");
-            let country_id: Option<i32> = record.get("country_id");
-            let operator_id: Option<i32> = record.get("operator_id");
+        Ok(prefix_map)
+    }
+
+    // Alternative method without query macro
+    async fn load_prefixes_from_db_manual(
+        pool: &Pool<Postgres>,
+    ) -> Result<HashMap<String, (Option<i32>, Option<i32>)>, AppError> {
+        use sqlx::Row;
+        
+        let rows = sqlx::query(
+            r#"
+            SELECT prefix, country_id, operator_id 
+            FROM cfg_prefixes 
+            WHERE is_valid IS TRUE
+            "#
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let mut prefix_map = HashMap::with_capacity(rows.len());
+        
+        for row in rows {
+            let prefix: String = row.try_get("prefix")?;
+            let country_id: Option<i32> = row.try_get("country_id")?;
+            let operator_id: Option<i32> = row.try_get("operator_id")?;
 
             prefix_map.insert(prefix, (country_id, operator_id));
         }
@@ -42,10 +76,12 @@ impl PrefixLookup {
     }
 
     pub fn lookup(&self, mut number: String) -> Prefixes {
+        // Normalize the input by removing leading '+'
         if number.starts_with('+') {
             number = number.chars().skip(1).collect();
         }
 
+        // Perform longest prefix match
         for i in (1..=number.len()).rev() {
             let prefix = &number[..i];
             if let Some(&(country_id, operator_id)) = self.prefix_map.get(prefix) {
@@ -57,9 +93,11 @@ impl PrefixLookup {
             }
         }
 
+        // No match found
         Prefixes::default()
     }
 
+    // Additional utility methods
     pub fn is_empty(&self) -> bool {
         self.prefix_map.is_empty()
     }
@@ -72,24 +110,33 @@ impl PrefixLookup {
         self.prefix_map.contains_key(prefix)
     }
 
+    // Fixed lifetime issue
     pub fn get_matching_prefixes<'a>(&self, number: &'a str) -> Vec<&'a str> {
         let normalized = number.trim_start_matches('+');
-        (1..=normalized.len())
-            .rev()
-            .filter_map(|i| {
-                let prefix = &normalized[..i];
-                if self.prefix_map.contains_key(prefix) {
-                    Some(prefix)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
+        let mut matches = Vec::new();
 
+        for i in (1..=normalized.len()).rev() {
+            let prefix = &normalized[..i];
+            if self.prefix_map.contains_key(prefix) {
+                matches.push(prefix);
+            }
+        }
+
+        matches
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadMetrics {
+    pub prefix_count: usize,
+    pub load_duration: std::time::Duration,
+}
+
+// Optional: Async refresh capability
+impl PrefixLookup {
     pub async fn refresh(&mut self, pool: &Pool<Postgres>) -> Result<LoadMetrics, AppError> {
         use std::time::Instant;
-
+        
         let start_time = Instant::now();
         let new_prefix_map = Self::load_prefixes_from_db(pool).await?;
         let load_duration = start_time.elapsed();
@@ -101,10 +148,4 @@ impl PrefixLookup {
             load_duration,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadMetrics {
-    pub prefix_count: usize,
-    pub load_duration: std::time::Duration,
 }
